@@ -1,10 +1,13 @@
 // ==UserScript==
 // @name         NTSC Exam Hall — Force Result Unlock
 // @namespace    https://ntsc.narayanatalent.com/
-// @version      1.1.0
-// @description  Unlocks the Exam Hall "Result" button when NTSC leaves it disabled (result published but flag not updated / exam-hall glitch). Opens the result using the site's own code path and APIs, exactly like a normal non-glitched test.
+// @version      1.2.0
+// @description  Unlocks the Exam Hall "Result" button when NTSC leaves it disabled (result published but flag not updated / exam-hall glitch) and forces the Leader Board tab on results that hide it. Uses the site's own code path and APIs.
 // @author       arena
+// @license      MIT
 // @icon         https://ntsc.narayanatalent.com/favicon.ico
+// @updateURL    https://raw.githubusercontent.com/Evo690/tamper/main/ntsc-force-result.user.js
+// @downloadURL  https://raw.githubusercontent.com/Evo690/tamper/main/ntsc-force-result.user.js
 // @match        https://ntsc.narayanatalent.com/*
 // @run-at       document-start
 // @grant        GM_getValue
@@ -77,9 +80,10 @@
    * ==================================================================== */
   const CFG_STORE_KEY = 'ntscForceResultConfig';
   const DEFAULTS = {
-    autoUnlock: true,   // network layer: flip publish flags
-    forceClick: true,   // force layer: unlock+route still-disabled buttons
-    showBadge: true,    // floating badge
+    autoUnlock: true,        // network layer: flip publish flags
+    forceClick: true,        // force layer: unlock+route still-disabled buttons
+    forceLeaderboard: true,  // add the Leader Board tab to results that hide it
+    showBadge: true,         // floating badge
     debug: false
   };
 
@@ -127,15 +131,115 @@
   // Used by the emergency fallback.
   const SEEN_TESTS = new Map();
 
-  const TARGET_ENDPOINTS = [
-    /\/exam-service\/api\/ExaminationHall\/GetTests(\?|$)/i,
-    /\/exam-service\/api\/Course\/GetScheduleExam(\?|$)/i
-  ];
+  const SCORE_BOARD_KEY = 'ntscForceResultLeaderboards';
 
-  function isTargetUrl(url) {
-    if (!url) return false;
+  const ENDPOINTS = {
+    tests: [
+      /\/exam-service\/api\/ExaminationHall\/GetTests(\?|$)/i,
+      /\/exam-service\/api\/Course\/GetScheduleExam(\?|$)/i
+    ],
+    analysis: [
+      /\/exam-service\/api\/ExaminationHall\/GetResultAnalysis\//i,
+      /\/exam-service\/api\/GroupPaper\/GetStudentResult\//i
+    ],
+    leaderboard: [
+      /\/exam-service\/api\/ExaminationHall\/GetLeaderboardScore(\?|$)/i
+    ]
+  };
+
+  /** 'tests' | 'analysis' | 'leaderboard' | null */
+  function endpointKind(url) {
+    if (!url) return null;
     const u = String(url);
-    return TARGET_ENDPOINTS.some((rx) => rx.test(u));
+    for (const kind of Object.keys(ENDPOINTS)) {
+      if (ENDPOINTS[kind].some((rx) => rx.test(u))) return kind;
+    }
+    return null;
+  }
+
+  /* ---- what we know about leaderboards, per testPaperId -----------------
+     ok   -> this test has a leaderboard, keep forcing it
+     none -> the server said there is nothing, don't force it again (7 days)
+  ---------------------------------------------------------------------- */
+  const LB_KNOWN = loadLbKnown();
+
+  function loadLbKnown() {
+    const map = new Map();
+    try {
+      const raw = (typeof GM_getValue === 'function')
+        ? GM_getValue(SCORE_BOARD_KEY, '{}')
+        : localStorage.getItem(SCORE_BOARD_KEY) || '{}';
+      const obj = JSON.parse(raw) || {};
+      const now = Date.now();
+      Object.keys(obj).forEach((id) => {
+        const it = obj[id];
+        if (it && it.state && now - (it.t || 0) < 7 * 864e5) map.set(id, it.state);
+      });
+    } catch (e) { /* ignore */ }
+    return map;
+  }
+
+  function lbRemember(id, state) {
+    if (id == null) return;
+    if (LB_KNOWN.get(String(id)) === state) return;
+    LB_KNOWN.set(String(id), state);
+    try {
+      const obj = {};
+      LB_KNOWN.forEach((v, k) => { obj[k] = { state: v, t: Date.now() }; });
+      const raw = JSON.stringify(obj);
+      if (typeof GM_setValue === 'function') GM_setValue(SCORE_BOARD_KEY, raw);
+      else localStorage.setItem(SCORE_BOARD_KEY, raw);
+    } catch (e) { /* ignore */ }
+  }
+
+  // latest result view we have seen, used by the "Leaderboard" pill
+  const LAST_ANALYSIS = { testPaperId: null, examId: null, subjects: [], testName: '', at: 0 };
+
+  /**
+   * Result-analysis responses (single paper + group paper).
+   * Adds isLeaderboard so the site renders its own "Leader Board" tab and
+   * fires GetLeaderboardScore by itself. Remembers the testPaperId either way.
+   */
+  function patchAnalysisPayload(json) {
+    const d = json && json.data;
+    if (!d || typeof d !== 'object') return false;
+
+    if (d.testPaperId != null) LAST_ANALYSIS.testPaperId = d.testPaperId;
+    if (d.examId != null) LAST_ANALYSIS.examId = d.examId;
+    else if (d.studentExamId != null) LAST_ANALYSIS.examId = d.studentExamId;
+    if (d.testName) LAST_ANALYSIS.testName = d.testName;
+    const subjects = d.result && Array.isArray(d.result.subjectData) ? d.result.subjectData : null;
+    if (subjects && subjects.length) {
+      LAST_ANALYSIS.subjects = subjects.map((x) => (x && x.subjectName) || '').filter(Boolean);
+    }
+    LAST_ANALYSIS.at = Date.now();
+
+    if (!cfg.forceLeaderboard) return false;
+    if (d.isLeaderboard === true) return false;
+
+    // Don't resurrect a tab we already know is empty for this paper.
+    const id = d.testPaperId;
+    if (id != null && LB_KNOWN.get(String(id)) === 'none') return false;
+
+    d.isLeaderboard = true;
+    log('forced leaderboard tab', id);
+    return true;
+  }
+
+  /** Learn from the site's own GetLeaderboardScore answer. */
+  function noteLeaderboardResult(json, requestBody) {
+    let id = null;
+    try {
+      const body = typeof requestBody === 'string' ? JSON.parse(requestBody) : requestBody;
+      if (body && body.id != null) id = body.id;
+    } catch (e) { /* ignore */ }
+    if (id == null) return false;
+
+    const rows = json && json.data && json.data.leaderboardScore;
+    const failed = !json || json.statusCode >= 400 || !json.data;
+    if (failed || !Array.isArray(rows) || !rows.length) lbRemember(id, 'none');
+    else lbRemember(id, 'ok');
+    return false;
   }
 
   /**
@@ -190,15 +294,27 @@
       return origOpen.apply(this, arguments);
     };
 
-    proto.send = function () {
+    proto.send = function (body) {
       try {
-        if (isTargetUrl(this.__ntscUrl)) installLazyResponsePatch(this, XHR);
+        const kind = endpointKind(this.__ntscUrl);
+        if (kind) {
+          this.__ntscKind = kind;
+          this.__ntscBody = typeof body === 'string' ? body : null;
+          installLazyResponsePatch(this, XHR, kind);
+        }
       } catch (e) { log('xhr hook error', e); }
       return origSend.apply(this, arguments);
     };
   }
 
-  function installLazyResponsePatch(xhr, XHR) {
+  function applyPayloadPatcher(kind, json, requestBody) {
+    if (kind === 'tests') return patchTestPayload(json);
+    if (kind === 'analysis') return patchAnalysisPayload(json);
+    if (kind === 'leaderboard') return noteLeaderboardResult(json, requestBody);
+    return false;
+  }
+
+  function installLazyResponsePatch(xhr, XHR, kind) {
     const textDesc = Object.getOwnPropertyDescriptor(XHR.prototype, 'responseText');
     const respDesc = Object.getOwnPropertyDescriptor(XHR.prototype, 'response');
     if (!textDesc || !textDesc.get) return;
@@ -213,7 +329,7 @@
       let out = raw;
       try {
         const json = JSON.parse(raw);
-        if (patchTestPayload(json)) out = JSON.stringify(json);
+        if (applyPayloadPatcher(kind, json, xhr.__ntscBody)) out = JSON.stringify(json);
       } catch (e) { /* not JSON, leave it */ }
       lastRaw = raw;
       lastOut = out;
@@ -237,7 +353,7 @@
           if (xhr.responseType === 'json') {
             const obj = respDesc && respDesc.get ? respDesc.get.call(xhr) : null;
             if (!jsonHandled && obj && typeof obj === 'object') {
-              try { patchTestPayload(obj); } catch (e) { /* ignore */ }
+              try { applyPayloadPatcher(kind, obj, xhr.__ntscBody); } catch (e) { /* ignore */ }
               jsonHandled = true;
             }
             return obj;
@@ -259,14 +375,16 @@
 
     const patchedFetch = function (input, init) {
       const url = typeof input === 'string' ? input : (input && input.url) || '';
+      const kind = endpointKind(url);
+      const reqBody = init && typeof init.body === 'string' ? init.body : null;
       const p = origFetch.apply(this, arguments);
-      if (!isTargetUrl(url)) return p;
+      if (!kind) return p;
 
       return p.then(async (res) => {
         try {
           const raw = await res.clone().text();
           const json = JSON.parse(raw);
-          if (patchTestPayload(json)) {
+          if (applyPayloadPatcher(kind, json, reqBody)) {
             const body = JSON.stringify(json);
             const headers = new Headers(res.headers);
             headers.delete('content-length');
@@ -605,7 +723,8 @@
   const API = {
     appearedResult: '/exam-service/api/ExaminationHall/GetAppearedResult',
     resultAnalysis: '/exam-service/api/ExaminationHall/GetResultAnalysis/',
-    courseExamId: '/exam-service/api/CourseResult/GetExamId/'
+    courseExamId: '/exam-service/api/CourseResult/GetExamId/',
+    leaderboard: '/exam-service/api/ExaminationHall/GetLeaderboardScore'
   };
 
   function getToken() {
@@ -698,6 +817,124 @@
     const res = await apiFetch(API.resultAnalysis + encodeURIComponent(attempt.examId));
     if (res.json && res.json.data) renderScoreSheet(test, res.json.data, attempt);
     else modalMessage('Analysis unavailable', (res.json && res.json.message) || 'The server did not return an analysis for this attempt.');
+  }
+
+  /* ======================================================================
+   * 6. LEADERBOARD — pill + table (uses the site's own endpoint)
+   * ==================================================================== */
+  let lbPill = null;
+  let lbBusy = false;
+
+  function resultViewMounted() {
+    return !!(document.querySelector('.result-analysis') ||
+              document.querySelector('.content.result-analysis') ||
+              document.querySelector('.score-card-table'));
+  }
+
+  function nativeLeaderboardTab() {
+    const links = document.querySelectorAll('.nav-link, .nav-item a, .nav-item p');
+    for (const el of links) {
+      const t = norm(el.textContent);
+      if (t === 'leader board' || t === 'leaderboard') return el;
+    }
+    return null;
+  }
+
+  /** Show the pill when a result is open, we know the paper id, and the site
+      did not render its own Leader Board tab. */
+  function syncLeaderboardPill() {
+    const known = LAST_ANALYSIS.testPaperId != null ? LB_KNOWN.get(String(LAST_ANALYSIS.testPaperId)) : null;
+    const wanted = cfg.forceLeaderboard &&
+      LAST_ANALYSIS.testPaperId != null &&
+      known !== 'none' &&                       // server already said there is none
+      Date.now() - LAST_ANALYSIS.at < 6 * 6e4 &&
+      resultViewMounted() &&
+      !nativeLeaderboardTab();
+
+    if (!wanted) {
+      if (lbPill && lbPill.parentNode) lbPill.parentNode.removeChild(lbPill);
+      lbPill = null;
+      return;
+    }
+    if (lbPill && document.body.contains(lbPill)) return;
+
+    lbPill = document.createElement('button');
+    lbPill.type = 'button';
+    lbPill.className = 'ntsc-fr-lb-pill';
+    lbPill.innerHTML = '<span>🏆</span> Leaderboard';
+    lbPill.title = 'Load the leaderboard for this result';
+    lbPill.addEventListener('click', openLeaderboard);
+    document.body.appendChild(lbPill);
+  }
+
+  function renderLeaderboard(rows, subjects) {
+    const yourId = LAST_ANALYSIS.examId;
+    let youIndex = -1;
+    if (yourId != null) {
+      const hits = rows.filter((r) => String(r.examId) === String(yourId));
+      if (hits.length === 1) youIndex = rows.indexOf(hits[0]);
+    }
+
+    // column headers: prefer subject names from the analysis, else from row data
+    let names = subjects && subjects.length ? subjects.slice() : [];
+    if (!names.length) {
+      const first = rows.find((r) => Array.isArray(r.subjectPerformance) && r.subjectPerformance.length);
+      if (first) names = first.subjectPerformance.map((x) => (x && x.subjectName) || '');
+    }
+
+    const head = '<tr><th>#</th><th>Student</th>' +
+      names.map((n) => '<th>' + esc(n) + '</th>').join('') +
+      '<th>Total</th><th>Rank</th></tr>';
+
+    const body = rows.map((r, i) => {
+      const perf = Array.isArray(r.subjectPerformance) ? r.subjectPerformance : [];
+      const cells = names.map((_, si) => {
+        const p = perf[si];
+        const v = p && p.totalMarks != null ? p.totalMarks : '—';
+        return '<td>' + esc(v) + '</td>';
+      }).join('');
+      const you = i === youIndex;
+      return '<tr class="' + (you ? 'ntsc-fr-you' : '') + '">' +
+        '<td>' + (i + 1) + '</td>' +
+        '<td class="ntsc-fr-lb-name">' + esc(r.studentName || ('Student ' + (i + 1))) + (you ? ' <span class="ntsc-fr-you-tag">you</span>' : '') + '</td>' +
+        cells +
+        '<td><b>' + esc(r.totalMarks != null ? r.totalMarks : '—') + '</b></td>' +
+        '<td>' + esc(r.ranks != null ? r.ranks : '—') + '</td>' +
+        '</tr>';
+    }).join('');
+
+    modalSet('Leaderboard',
+      '<div class="ntsc-fr-meta">' + esc(LAST_ANALYSIS.testName || 'Result') + ' · ' + rows.length + ' student(s)</div>' +
+      '<div class="ntsc-fr-lb-wrap"><table class="ntsc-fr-table ntsc-fr-lb"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>' +
+      '<div class="ntsc-fr-note">Same data as the site\'s Leader Board tab (ExaminationHall/GetLeaderboardScore).</div>');
+  }
+
+  async function openLeaderboard() {
+    if (lbBusy) return;
+    const id = LAST_ANALYSIS.testPaperId;
+    if (id == null) { toast('No leaderboard id for this result'); return; }
+
+    lbBusy = true;
+    modalLoading('Loading leaderboard…');
+    try {
+      const res = await apiFetch(API.leaderboard, { method: 'POST', body: { id } });
+      const payload = res.json;
+      const rows = payload && payload.data && Array.isArray(payload.data.leaderboardScore)
+        ? payload.data.leaderboardScore
+        : null;
+
+      if (rows && rows.length) {
+        lbRemember(id, 'ok');
+        renderLeaderboard(rows, LAST_ANALYSIS.subjects);
+      } else {
+        lbRemember(id, 'none');
+        modalMessage('Leaderboard', (payload && payload.message) || 'No leaderboard published for this result.');
+      }
+    } catch (e) {
+      modalMessage('Leaderboard', 'Could not reach the leaderboard API.');
+    } finally {
+      lbBusy = false;
+    }
   }
 
   /* ---- fallback UI ---------------------------------------------------- */
@@ -841,6 +1078,14 @@
   .ntsc-fr-link{border:1px solid #bfdbfe;background:#eff6ff;color:#007fbe;border-radius:8px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer}
   .ntsc-fr-link:hover{background:#dbeafe}
   .ntsc-fr-note{margin-top:14px;color:#94a3b8;font-size:11px}
+  .ntsc-fr-lb-pill{position:fixed;left:14px;bottom:14px;z-index:2147483000;display:flex;align-items:center;gap:7px;padding:8px 13px;border-radius:999px;border:1px solid #bfdbfe;background:#eff6ff;color:#007fbe;font:600 12px/1.2 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;box-shadow:0 6px 20px rgba(0,60,120,.18);cursor:pointer;transition:transform .15s ease,background .15s ease}
+  .ntsc-fr-lb-pill:hover{background:#dbeafe;transform:translateY(-1px)}
+  .ntsc-fr-lb-pill span{font-size:13px;line-height:1}
+  .ntsc-fr-lb-wrap{max-height:52vh;overflow:auto;border:1px solid #eef2f7;border-radius:10px}
+  .ntsc-fr-lb th{position:sticky;top:0;z-index:1}
+  .ntsc-fr-lb-name{white-space:nowrap;font-weight:600;color:#0b4f7a}
+  .ntsc-fr-lb tr.ntsc-fr-you td{background:#eff6ff}
+  .ntsc-fr-you-tag{font-size:9.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;background:#007fbe;color:#fff;border-radius:5px;padding:1px 5px;margin-left:4px}
   `;
 
   let badgeEl = null;
@@ -886,6 +1131,8 @@
         <div><b>Auto-unlock result flags</b><span>Flips isPublish / isResultAutoPublish in the GetTests response so the button is active like a normal test.</span></div></label>
       <label class="ntsc-fr-row"><input type="checkbox" data-k="forceClick" ${cfg.forceClick ? 'checked' : ''}>
         <div><b>Force-click locked buttons</b><span>Any Result button still disabled gets unlocked and routed through the site's own result flow.</span></div></label>
+      <label class="ntsc-fr-row"><input type="checkbox" data-k="forceLeaderboard" ${cfg.forceLeaderboard ? 'checked' : ''}>
+        <div><b>Force leaderboard</b><span>Adds the Leader Board tab to results that hide it (skipped automatically for tests that have none).</span></div></label>
       <label class="ntsc-fr-row"><input type="checkbox" data-k="showBadge" ${cfg.showBadge ? 'checked' : ''}>
         <div><b>Show this badge</b><span>Hide it if you want a clean exam hall.</span></div></label>
       <label class="ntsc-fr-row"><input type="checkbox" data-k="debug" ${cfg.debug ? 'checked' : ''}>
@@ -942,6 +1189,7 @@
     try {
       resultButtons().forEach(processButton);
     } catch (e) { log('scan error', e); }
+    try { syncLeaderboardPill(); } catch (e) { log('pill error', e); }
     const counter = document.getElementById('ntsc-fr-count');
     if (counter) counter.textContent = String(forcedCount);
   }
@@ -999,6 +1247,11 @@
     });
     GM_registerMenuCommand('Toggle force-click', () => {
       cfg.forceClick = !cfg.forceClick; saveCfg(); updateBadge(); toast('Force-click: ' + (cfg.forceClick ? 'ON' : 'OFF'));
+    });
+    GM_registerMenuCommand('Toggle force leaderboard', () => {
+      cfg.forceLeaderboard = !cfg.forceLeaderboard; saveCfg(); updateBadge();
+      syncLeaderboardPill();
+      toast('Force leaderboard: ' + (cfg.forceLeaderboard ? 'ON' : 'OFF') + ' (reload to apply)');
     });
     GM_registerMenuCommand('Toggle debug logs', () => {
       cfg.debug = !cfg.debug; saveCfg(); toast('Debug: ' + (cfg.debug ? 'ON' : 'OFF'));
