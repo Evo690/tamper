@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NTSC Exam Hall — Force Result Unlock
 // @namespace    https://ntsc.narayanatalent.com/
-// @version      1.3.0
-// @description  Unlocks the Exam Hall "Result" button when NTSC leaves it disabled (result published but flag not updated / exam-hall glitch), forces the Leader Board tab on results that hide it, and kills the full-screen "Special Announcement" home page pop-up. Uses the site's own code path and APIs.
+// @version      1.4.0
+// @description  Unlocks the Exam Hall "Result" button when NTSC leaves it disabled (result published but flag not updated / exam-hall glitch), forces the Leader Board tab on results that hide it, and kills the full-screen "Special Announcement" home page pop-up. One settings screen: click the badge, press Alt+N, type s.ntsc, or open /#ntsc-settings.
 // @author       arena
 // @license      MIT
 // @icon         https://ntsc.narayanatalent.com/favicon.ico
@@ -119,6 +119,25 @@
                        (cached Redux state, site refactor, ...).
 
  Nothing is written to the server, nothing is blocked for other banners.
+
+ ---------------------------------------------------------------------------
+ ONE SETTINGS SCREEN, FIVE DOORS  (1.4.0)
+ ---------------------------------------------------------------------------
+ Every option lives in a single full-page settings screen. Open it with any of:
+
+     click the NTSC Tools badge      bottom-right pill
+     Alt + N                         anywhere on the site (Esc closes)
+     type  s.ntsc                    anywhere on the page, nothing to install
+     go to /#ntsc-settings           or /s.ntsc - bookmarkable
+     Tampermonkey menu -> Open settings
+
+ A userscript cannot see what you type in the *omnibox*, so "s.ntsc" in the
+ address bar needs a one-time Chrome setup (documented in the settings screen
+ and the README): add a site-search keyword `s.ntsc` pointing at
+ https://ntsc.narayanatalent.com/#ntsc-settings  ->  then the omnibox works too.
+
+ The screen remembers nothing extra: it is rendered from `cfg` on every open and
+ every switch writes straight back through GM_setValue / localStorage.
  ---------------------------------------------------------------------------
 */
 
@@ -140,7 +159,14 @@
     hidePopup: true,         // MASTER switch for the pop-up blocker
     popupBlockApi: true,     // A: strip bannerType 6 from GetWebBanners
     popupSeenFlag: true,     // B: pretend sessionStorage says "already seen"
-    popupKillDom: true       // C: hide any overlay that still renders
+    popupKillDom: true,      // C: hide any overlay that still renders
+
+    // ---- settings screen (1.4.0) ----
+    showBadge: true,         // (kept here so the Interface group reads in order)
+    openOnType: true,        // type "s.ntsc" anywhere on the page to open
+    openOnHotkey: true,      // Alt + N
+    openOnUrl: true,         // /#ntsc-settings  or  /s.ntsc
+    typePhrase: 's.ntsc'     // the phrase for openOnType
   };
 
   const cfg = Object.assign({}, DEFAULTS, loadCfg());
@@ -1183,12 +1209,11 @@
   const POPUP_HIDDEN = ['display', 'visibility', 'pointer-events'];
 
   let popupStyleEl = null;
-  let panelPopupCount = null;
   const popupKilled = new Set();
 
-  /** Keep the panel's "pop-ups blocked" counter in sync. */
+  /** Keep the settings screen's "pop-ups blocked" stat in sync. */
   function bumpPopupCounter() {
-    if (panelPopupCount) panelPopupCount.textContent = String(popupTotal());
+    if (statPopupEl) statPopupEl.textContent = String(popupTotal());
   }
 
   function injectPopupStyle() {
@@ -1263,7 +1288,433 @@
   function applyPopupSettings() {
     syncPopupStyle();
     sweepPopups();
-    if (panelPopupCount) panelPopupCount.textContent = String(popupTotal());
+    bumpPopupCounter();
+  }
+
+  /* ======================================================================
+   * 6c. UNIFIED SETTINGS SCREEN — every option in one place
+   *     Full-page takeover. Opened by ANY of:
+   *        · clicking the badge        · Alt + N
+   *        · typing "s.ntsc"           · /#ntsc-settings   or   /s.ntsc
+   *        · the Tampermonkey menu
+   *     Esc (or the x) closes.
+   * ==================================================================== */
+
+  const VERSION = '1.4.0';
+  const SETTINGS_HASH = '#ntsc-settings';
+  const DEFAULT_PHRASE = 's.ntsc';
+
+  /* ---- every option, in order, with the copy shown next to its switch ---- */
+  const OPT_DEFS = {
+    hidePopup: {
+      label: 'Block the home pop-up',
+      desc: 'Master switch. Kills the full-screen "Special Announcement" overlay on every visit.'
+    },
+    popupBlockApi: {
+      label: 'A · Remove it from the banner API',
+      desc: 'Drops the HomePagePopupBanner from GetWebBanners, so the overlay is never built and its image is never downloaded.',
+      sub: 'hidePopup', reload: true
+    },
+    popupSeenFlag: {
+      label: 'B · Pretend it was already seen',
+      desc: 'Makes sessionStorage answer "true" for every hasSeenPopup_* key.',
+      sub: 'hidePopup'
+    },
+    popupKillDom: {
+      label: 'C · Hide anything that still renders',
+      desc: 'CSS + sweep on .home-popup-overlay. Last line of defence if the site changes shape.',
+      sub: 'hidePopup'
+    },
+
+    autoUnlock: {
+      label: 'Auto-unlock result flags',
+      desc: 'Flips isPublish / isResultAutoPublish in the GetTests response so the Result button is a normal, active button.',
+      reload: true
+    },
+    forceClick: {
+      label: 'Force-click locked buttons',
+      desc: 'Any Result button still disabled gets unlocked and routed through the site\'s own result flow.',
+      reload: true
+    },
+    forceLeaderboard: {
+      label: 'Force leaderboard',
+      desc: 'Adds the Leader Board tab to results that hide it. Skipped automatically for tests that have none.',
+      reload: true
+    },
+
+    showBadge: {
+      label: 'Show the floating badge',
+      desc: 'The NTSC Tools pill in the bottom-right corner. Clicking it opens this screen.'
+    },
+    openOnType: {
+      label: 'Open when I type s.ntsc',
+      desc: 'Just start typing the phrase anywhere on the page — no navigation, nothing to set up.'
+    },
+    openOnHotkey: {
+      label: 'Open with Alt + N',
+      desc: 'Keyboard shortcut. Esc closes this screen again.'
+    },
+    openOnUrl: {
+      label: 'Open from the address bar',
+      desc: 'Going to /#ntsc-settings (or /s.ntsc) opens this screen. Bookmarkable.'
+    },
+    debug: {
+      label: 'Debug logs',
+      desc: 'Print what the script is doing to the browser console.'
+    }
+  };
+
+  const OPT_GROUPS = [
+    {
+      title: 'Home page pop-up',
+      hint: 'It returns every visit because the "seen" flag lives in sessionStorage (new tab = new session) and the banner is re-fetched on every load.',
+      keys: ['hidePopup', 'popupBlockApi', 'popupSeenFlag', 'popupKillDom']
+    },
+    {
+      title: 'Exam hall',
+      hint: 'Forces the Result button and the hidden Leader Board tab. Changes here need a reload.',
+      keys: ['autoUnlock', 'forceClick', 'forceLeaderboard']
+    },
+    {
+      title: 'Interface & triggers',
+      hint: 'How this settings screen can be reached, plus the badge and logging.',
+      keys: ['showBadge', 'openOnType', 'openOnHotkey', 'openOnUrl', 'debug']
+    }
+  ];
+
+  let settingsEl = null;
+  let settingsOpen = false;
+  let statPopupEl = null;
+  let statUnlockEl = null;
+  let statLbEl = null;
+  const phraseBuf = { s: '', at: 0 };
+
+  /* ---- rendering ------------------------------------------------------- */
+  function optRow(k) {
+    const d = OPT_DEFS[k] || { label: k, desc: '' };
+    return '<label class="ntsc-fr-opt' + (d.sub ? ' ntsc-fr-sub' : '') + '" data-k="' + k + '" data-search="' +
+      esc((d.label + ' ' + d.desc).toLowerCase()) + '">' +
+      '<input type="checkbox" ' + (cfg[k] ? 'checked' : '') + '>' +
+      '<span class="ntsc-fr-switch"></span>' +
+      '<span class="ntsc-fr-txt"><b>' + esc(d.label) +
+      (d.reload ? '<i class="ntsc-fr-reload">reload</i>' : '') + '</b>' +
+      '<span>' + esc(d.desc) + '</span></span></label>';
+  }
+
+  function settingsHTML() {
+    let groups = '';
+    OPT_GROUPS.forEach((g) => {
+      groups +=
+        '<section class="ntsc-fr-card" data-search="' + esc(g.title.toLowerCase()) + '">' +
+          '<header class="ntsc-fr-card-h"><h3>' + esc(g.title) + '</h3>' +
+          (g.hint ? '<p>' + esc(g.hint) + '</p>' : '') + '</header>' +
+          '<div class="ntsc-fr-card-b">' + g.keys.map(optRow).join('') + '</div>' +
+        '</section>';
+    });
+
+    return '' +
+      '<div class="ntsc-fr-top">' +
+        '<div class="ntsc-fr-brand"><span class="ntsc-fr-logo">N</span>' +
+          '<div><h2>NTSC Tools</h2><p>Result unlock &amp; pop-up blocker · v' + esc(VERSION) + '</p></div></div>' +
+        '<input id="ntsc-fr-search" class="ntsc-fr-search" type="search" placeholder="Search settings…" autocomplete="off" spellcheck="false">' +
+        '<button type="button" class="ntsc-fr-x" id="ntsc-fr-x" aria-label="Close settings">×</button>' +
+      '</div>' +
+      '<div class="ntsc-fr-scroll"><div class="ntsc-fr-wrap">' +
+        '<div class="ntsc-fr-empty-search" id="ntsc-fr-noresult">No setting matches that.</div>' +
+        groups +
+        '<section class="ntsc-fr-card" data-search="phrase type open s.ntsc">' +
+          '<header class="ntsc-fr-card-h"><h3>Type-to-open phrase</h3>' +
+            '<p>Change what you type on the page to summon this screen.</p></header>' +
+          '<div class="ntsc-fr-card-b"><div class="ntsc-fr-phrase">' +
+            '<code>phrase</code>' +
+            '<input id="ntsc-fr-phrase" type="text" value="' + esc(cfg.typePhrase || DEFAULT_PHRASE) + '" spellcheck="false" autocomplete="off">' +
+            '<button type="button" class="ntsc-fr-btn" id="ntsc-fr-phrase-reset">Reset</button>' +
+          '</div></div>' +
+        '</section>' +
+        '<section class="ntsc-fr-card" data-search="stats counters blocked">' +
+          '<header class="ntsc-fr-card-h"><h3>This visit</h3></header>' +
+          '<div class="ntsc-fr-card-b ntsc-fr-stats">' +
+            '<div><span id="ntsc-fr-st-pop">0</span><b>pop-ups blocked</b></div>' +
+            '<div><span id="ntsc-fr-st-unlock">0</span><b>results unlocked</b></div>' +
+            '<div><span id="ntsc-fr-st-lb">0</span><b>leaderboards cached</b></div>' +
+          '</div>' +
+        '</section>' +
+        '<section class="ntsc-fr-card" data-search="actions reset copy rescan">' +
+          '<header class="ntsc-fr-card-h"><h3>Actions</h3></header>' +
+          '<div class="ntsc-fr-card-b ntsc-fr-actions">' +
+            '<button type="button" class="ntsc-fr-btn" id="ntsc-fr-rescan">Re-scan page</button>' +
+            '<button type="button" class="ntsc-fr-btn" id="ntsc-fr-copy">Copy settings</button>' +
+            '<button type="button" class="ntsc-fr-btn ntsc-fr-danger" id="ntsc-fr-reset">Reset to defaults</button>' +
+          '</div>' +
+        '</section>' +
+        '<section class="ntsc-fr-card" data-search="how open trigger badge alt n hotkey address bar url">' +
+          '<header class="ntsc-fr-card-h"><h3>How to open this screen</h3></header>' +
+          '<div class="ntsc-fr-card-b"><ul class="ntsc-fr-how">' +
+            '<li><b>Click the badge</b> — the NTSC Tools pill, bottom right.</li>' +
+            '<li><b>Alt + N</b> — anywhere on the site. Esc closes.</li>' +
+            '<li><b>Type</b> <code>s.ntsc</code> — start typing it anywhere on the page.</li>' +
+            '<li><b>Address bar</b> — <code>ntsc.narayanatalent.com/#ntsc-settings</code> or <code>ntsc.narayanatalent.com/s.ntsc</code>.</li>' +
+            '<li><b>Tampermonkey menu</b> → "Open settings".</li>' +
+            '<li><b>Omnibox tip</b> — in <i>chrome://settings/searchEngines</i> add a site search named ' +
+              '<code>s.ntsc</code> with keyword <code>s.ntsc</code> and URL ' +
+              '<code>https://ntsc.narayanatalent.com/#ntsc-settings</code>. Then typing ' +
+              '<code>s.ntsc</code> + Enter in the address bar lands straight here.</li>' +
+          '</ul></div>' +
+        '</section>' +
+      '</div></div>';
+  }
+
+  function syncSettingsRows() {
+    if (!settingsEl) return;
+    settingsEl.querySelectorAll('.ntsc-fr-opt[data-k]').forEach((row) => {
+      const k = row.getAttribute('data-k');
+      const inp = row.querySelector('input');
+      if (inp) inp.checked = !!cfg[k];
+      const d = OPT_DEFS[k];
+      if (d && d.sub) row.classList.toggle('ntsc-fr-dim', !cfg[d.sub]);
+    });
+    if (statPopupEl) statPopupEl.textContent = String(popupTotal());
+    if (statUnlockEl) statUnlockEl.textContent = String(forcedCount);
+    if (statLbEl) statLbEl.textContent = String(LB_KNOWN.size);
+  }
+
+  function wireSettings() {
+    if (!settingsEl) return;
+
+    settingsEl.querySelectorAll('.ntsc-fr-opt[data-k] input').forEach((inp) => {
+      inp.addEventListener('change', () => {
+        const row = inp.closest('.ntsc-fr-opt');
+        const k = row && row.getAttribute('data-k');
+        if (!k) return;
+        cfg[k] = inp.checked;
+        saveCfg();
+        onSettingChanged(k);
+      });
+    });
+
+    const closeBtn = settingsEl.querySelector('#ntsc-fr-x');
+    if (closeBtn) closeBtn.addEventListener('click', closeSettings);
+
+    const search = settingsEl.querySelector('#ntsc-fr-search');
+    const noResult = settingsEl.querySelector('#ntsc-fr-noresult');
+    if (search) {
+      search.addEventListener('input', () => {
+        const q = search.value.trim().toLowerCase();
+        let hits = 0;
+        settingsEl.querySelectorAll('.ntsc-fr-opt[data-k]').forEach((row) => {
+          const hit = !q || (row.getAttribute('data-search') || '').indexOf(q) !== -1;
+          row.style.display = hit ? '' : 'none';
+          if (hit) hits++;
+        });
+        settingsEl.querySelectorAll('.ntsc-fr-card').forEach((card) => {
+          const rows = card.querySelectorAll('.ntsc-fr-opt[data-k]');
+          const any = rows.length === 0
+            ? !q || (card.getAttribute('data-search') || '').indexOf(q) !== -1
+            : Array.prototype.some.call(rows, (r) => r.style.display !== 'none');
+          card.style.display = any ? '' : 'none';
+        });
+        if (noResult) noResult.style.display = hits ? 'none' : 'block';
+      });
+    }
+
+    const phrase = settingsEl.querySelector('#ntsc-fr-phrase');
+    if (phrase) {
+      phrase.addEventListener('change', () => {
+        cfg.typePhrase = String(phrase.value || '').trim() || DEFAULT_PHRASE;
+        phrase.value = cfg.typePhrase;
+        saveCfg();
+        phraseBuf.s = '';
+        toast('Phrase set to "' + cfg.typePhrase + '"');
+      });
+      // don't let the phrase field eat the Alt+N / Esc shortcuts
+      phrase.addEventListener('keydown', (e) => { if (e.key === 'Escape') phrase.blur(); });
+    }
+    const phraseReset = settingsEl.querySelector('#ntsc-fr-phrase-reset');
+    if (phraseReset) {
+      phraseReset.addEventListener('click', () => {
+        cfg.typePhrase = DEFAULT_PHRASE;
+        saveCfg();
+        if (phrase) phrase.value = DEFAULT_PHRASE;
+        phraseBuf.s = '';
+        toast('Phrase reset to "' + DEFAULT_PHRASE + '"');
+      });
+    }
+
+    const rescan = settingsEl.querySelector('#ntsc-fr-rescan');
+    if (rescan) rescan.addEventListener('click', () => { scan(); toast('Re-scanned the page'); });
+
+    const copy = settingsEl.querySelector('#ntsc-fr-copy');
+    if (copy) copy.addEventListener('click', () => {
+      const text = JSON.stringify(cfg, null, 2);
+      const done = () => toast('Settings copied to clipboard');
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+        } else fallbackCopy(text, done);
+      } catch (e) { fallbackCopy(text, done); }
+    });
+
+    const reset = settingsEl.querySelector('#ntsc-fr-reset');
+    if (reset) reset.addEventListener('click', () => {
+      Object.keys(DEFAULTS).forEach((k) => { cfg[k] = DEFAULTS[k]; });
+      saveCfg();
+      renderSettings();
+      applyPopupSettings();
+      if (badgeEl) badgeEl.style.display = cfg.showBadge ? '' : 'none';
+      updateBadge();
+      try { syncLeaderboardPill(); } catch (e) { /* ignore */ }
+      toast('Settings reset to defaults');
+    });
+
+    statPopupEl = settingsEl.querySelector('#ntsc-fr-st-pop');
+    statUnlockEl = settingsEl.querySelector('#ntsc-fr-st-unlock');
+    statLbEl = settingsEl.querySelector('#ntsc-fr-st-lb');
+  }
+
+  function fallbackCopy(text, done) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      done();
+    } catch (e) { toast('Copy failed — see console'); console.log('[NTSC] settings:', text); }
+  }
+
+  function onSettingChanged(k) {
+    if (k === 'showBadge' && badgeEl) badgeEl.style.display = cfg.showBadge ? '' : 'none';
+    if (POPUP_KEYS.has(k)) applyPopupSettings();
+    if (k === 'forceLeaderboard') { try { syncLeaderboardPill(); } catch (e) { /* ignore */ } }
+    updateBadge();
+    syncSettingsRows();
+
+    if (POPUP_KEYS.has(k)) {
+      toast(k === 'hidePopup'
+        ? (cfg.hidePopup ? 'Pop-up blocker: ON' : 'Pop-up blocker: OFF')
+        : 'Saved — ' + (cfg[k] ? 'layer ON' : 'layer OFF'));
+    } else if (OPT_DEFS[k] && OPT_DEFS[k].reload) {
+      toast('Saved — reload the page to apply');
+    }
+  }
+
+  function renderSettings() {
+    if (!settingsEl) return;
+    settingsEl.innerHTML = settingsHTML();
+    wireSettings();
+    syncSettingsRows();
+  }
+
+  /* ---- open / close ---------------------------------------------------- */
+  function openSettings() {
+    if (settingsOpen) { renderSettings(); return; }
+    settingsOpen = true;
+    try { document.documentElement.classList.add('ntsc-fr-settings-open'); } catch (e) { /* ignore */ }
+
+    settingsEl = document.createElement('div');
+    settingsEl.className = 'ntsc-fr-settings';
+    settingsEl.id = 'ntsc-fr-settings';
+    renderSettings();
+    (document.body || document.documentElement).appendChild(settingsEl);
+
+    // reflect it in the URL so the address bar can be copied / bookmarked
+    try {
+      const path = (location.pathname || '/').replace(/\/+$/, '');
+      const base = path.toLowerCase() === '/s.ntsc' ? '/' : (location.pathname || '/');
+      history.replaceState(null, '', base + (location.search || '') + SETTINGS_HASH);
+    } catch (e) { /* ignore */ }
+    log('settings opened');
+  }
+
+  function closeSettings() {
+    if (!settingsOpen) return;
+    settingsOpen = false;
+    try { document.documentElement.classList.remove('ntsc-fr-settings-open'); } catch (e) { /* ignore */ }
+    if (settingsEl && settingsEl.parentNode) settingsEl.parentNode.removeChild(settingsEl);
+    settingsEl = null;
+    statPopupEl = statUnlockEl = statLbEl = null;
+    try {
+      if (location.hash === SETTINGS_HASH) {
+        history.replaceState(null, '', (location.pathname || '/') + (location.search || ''));
+      }
+    } catch (e) { /* ignore */ }
+    log('settings closed');
+  }
+
+  function toggleSettings() {
+    if (settingsOpen) closeSettings();
+    else openSettings();
+  }
+
+  /* ---- triggers -------------------------------------------------------- */
+  function urlWantsSettings() {
+    if (!cfg.openOnUrl) return false;
+    try {
+      const u = new URL(location.href);
+      if (u.hash === SETTINGS_HASH) return true;
+      if (u.pathname.replace(/\/+$/, '').toLowerCase() === '/s.ntsc') return true;
+      if (/(^|[?&])s\.ntsc([=&]|$)/i.test(u.search || '')) return true;
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
+  function onKeyDown(e) {
+    if (settingsOpen && e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeSettings();
+      return;
+    }
+
+    // Alt + N
+    if (cfg.openOnHotkey && e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey &&
+        (e.code === 'KeyN' || (e.key && e.key.toLowerCase() === 'n'))) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleSettings();
+      return;
+    }
+
+    // typed phrase, e.g. "s.ntsc"
+    if (!cfg.openOnType || settingsOpen) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (!e.key || e.key.length !== 1) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+
+    const now = Date.now();
+    if (now - phraseBuf.at > 1500) phraseBuf.s = '';
+    phraseBuf.at = now;
+    phraseBuf.s = (phraseBuf.s + String(e.key).toLowerCase()).slice(-64);
+    const phrase = String(cfg.typePhrase || DEFAULT_PHRASE).toLowerCase();
+    if (phrase && phraseBuf.s.endsWith(phrase)) {
+      phraseBuf.s = '';
+      openSettings();
+    }
+  }
+
+  function installSettingsTriggers() {
+    document.addEventListener('keydown', onKeyDown, true);
+
+    window.addEventListener('hashchange', () => { if (urlWantsSettings()) openSettings(); });
+    window.addEventListener('popstate', () => {
+      if (urlWantsSettings()) openSettings();
+      else if (settingsOpen) closeSettings();
+    });
+
+    if (urlWantsSettings()) {
+      // normalise the URL back onto a real route
+      try {
+        const path = (location.pathname || '/').replace(/\/+$/, '');
+        if (path.toLowerCase() === '/s.ntsc') history.replaceState(null, '', '/' + (location.search || ''));
+      } catch (e) { /* ignore */ }
+
+      if (document.body) openSettings();
+      else document.addEventListener('DOMContentLoaded', () => openSettings(), { once: true });
+    }
   }
 
   /* ======================================================================
@@ -1275,24 +1726,10 @@
   .ntsc-fr-badge .ntsc-fr-dot{width:7px;height:7px;border-radius:50%;background:#8ef0b0;box-shadow:0 0 0 3px rgba(142,240,176,.25)}
   .ntsc-fr-badge.ntsc-fr-off{background:#64748b}
   .ntsc-fr-badge.ntsc-fr-off .ntsc-fr-dot{background:#cbd5e1;box-shadow:none}
-  .ntsc-fr-panel{position:fixed;right:14px;bottom:56px;z-index:2147483001;width:296px;background:#fff;color:#0f172a;border:1px solid #e2e8f0;border-radius:14px;box-shadow:0 18px 44px rgba(15,23,42,.22);font:13px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow:hidden}
-  .ntsc-fr-panel h4{margin:0;padding:13px 15px;font-size:13px;letter-spacing:.2px;border-bottom:1px solid #eef2f7;background:#f8fbff;color:#0b4f7a;display:flex;justify-content:space-between;align-items:center}
-  .ntsc-fr-panel h4 small{font-weight:500;color:#64748b;font-size:11px}
-  .ntsc-fr-panel .ntsc-fr-row{display:flex;align-items:flex-start;gap:10px;padding:11px 15px;border-bottom:1px solid #f1f5f9;cursor:pointer}
-  .ntsc-fr-panel .ntsc-fr-row:hover{background:#f8fbff}
-  .ntsc-fr-panel .ntsc-fr-row input{margin-top:2px;accent-color:#007fbe}
-  .ntsc-fr-panel .ntsc-fr-row.ntsc-fr-sub{padding-left:30px;background:#fcfdff}
-  .ntsc-fr-panel .ntsc-fr-row.ntsc-fr-sub b{font-weight:500;color:#334155}
-  .ntsc-fr-panel .ntsc-fr-sep{padding:8px 15px;background:#f1f5f9;color:#64748b;font-size:10.5px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;border-bottom:1px solid #e2e8f0}
-  .ntsc-fr-panel .ntsc-fr-row b{display:block;font-size:12.5px;font-weight:600}
-  .ntsc-fr-panel .ntsc-fr-row span{color:#64748b;font-size:11.5px}
-  .ntsc-fr-foot{padding:10px 15px;display:flex;justify-content:space-between;align-items:center;color:#64748b;font-size:11.5px;background:#f8fbff}
-  .ntsc-fr-foot button{border:1px solid #cbd5e1;background:#fff;border-radius:8px;padding:5px 10px;font-size:11.5px;color:#0f172a;cursor:pointer}
-  .ntsc-fr-foot button:hover{background:#eff6ff;border-color:#bfdbfe}
   .btn-analysis-result.ntsc-fr-forced{border-color:#007fbe!important;color:#007fbe!important;background:#f3faff!important;position:relative}
   .btn-analysis-result.ntsc-fr-forced:hover{background:#e6f4ff!important}
   .btn-analysis-result.ntsc-fr-forced::after{content:"⚡";position:absolute;top:-7px;right:-6px;font-size:10px;line-height:1;background:#007fbe;color:#fff;border-radius:50%;width:15px;height:15px;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 6px rgba(0,127,190,.45)}
-  .ntsc-fr-toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(10px);z-index:2147483100;background:#0f172a;color:#fff;padding:10px 16px;border-radius:10px;font:600 12.5px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;box-shadow:0 12px 30px rgba(15,23,42,.35);opacity:0;pointer-events:none;transition:opacity .2s ease,transform .2s ease;max-width:78vw;text-align:center}
+  .ntsc-fr-toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(10px);z-index:2147483647;background:#0f172a;color:#fff;padding:10px 16px;border-radius:10px;font:600 12.5px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;box-shadow:0 12px 30px rgba(15,23,42,.35);opacity:0;pointer-events:none;transition:opacity .2s ease,transform .2s ease;max-width:78vw;text-align:center}
   .ntsc-fr-toast.ntsc-fr-show{opacity:1;transform:translateX(-50%) translateY(0)}
   .ntsc-fr-modal-root{position:fixed;inset:0;z-index:2147483200;display:flex;align-items:center;justify-content:center;padding:18px}
   .ntsc-fr-modal-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.55);backdrop-filter:blur(2px)}
@@ -1325,7 +1762,64 @@
   .ntsc-fr-lb-name{white-space:nowrap;font-weight:600;color:#0b4f7a}
   .ntsc-fr-lb tr.ntsc-fr-you td{background:#eff6ff}
   .ntsc-fr-you-tag{font-size:9.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;background:#007fbe;color:#fff;border-radius:5px;padding:1px 5px;margin-left:4px}
-  `;
+
+  /* ---- settings screen (full-page takeover) ---- */
+  html.ntsc-fr-settings-open,html.ntsc-fr-settings-open body{overflow:hidden!important}
+  .ntsc-fr-settings{position:fixed;inset:0;z-index:2147483646;display:flex;flex-direction:column;background:#f1f5f9;color:#0f172a;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;animation:ntsc-fr-fade .16s ease}
+  @keyframes ntsc-fr-fade{from{opacity:0}to{opacity:1}}
+  .ntsc-fr-top{flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:12px 18px;background:#fff;border-bottom:1px solid #e2e8f0;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+  .ntsc-fr-brand{display:flex;align-items:center;gap:11px;min-width:0}
+  .ntsc-fr-logo{width:34px;height:34px;flex:0 0 auto;border-radius:9px;background:#007fbe;color:#fff;font-weight:800;display:flex;align-items:center;justify-content:center;font-size:17px}
+  .ntsc-fr-top h2{margin:0;font-size:16px;font-weight:700;color:#0b4f7a;white-space:nowrap}
+  .ntsc-fr-top p{margin:1px 0 0;font-size:11.5px;color:#64748b;white-space:nowrap}
+  .ntsc-fr-search{flex:1 1 auto;max-width:420px;margin-left:auto;padding:9px 13px;border:1px solid #cbd5e1;border-radius:9px;font-size:13.5px;background:#f8fafc;color:#0f172a;outline:none}
+  .ntsc-fr-search:focus{border-color:#007fbe;background:#fff;box-shadow:0 0 0 3px rgba(0,127,190,.14)}
+  .ntsc-fr-x{flex:0 0 auto;width:34px;height:34px;border:0;border-radius:9px;background:#f1f5f9;color:#475569;font-size:20px;line-height:1;cursor:pointer}
+  .ntsc-fr-x:hover{background:#e2e8f0;color:#0f172a}
+  .ntsc-fr-scroll{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:20px 18px 40px}
+  .ntsc-fr-wrap{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+  .ntsc-fr-card{background:#fff;border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+  .ntsc-fr-card-h{padding:14px 18px 12px;border-bottom:1px solid #eef2f7;background:#f8fbff}
+  .ntsc-fr-card-h h3{margin:0;font-size:12.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#0b4f7a}
+  .ntsc-fr-card-h p{margin:5px 0 0;font-size:12.5px;color:#64748b}
+  .ntsc-fr-opt{display:flex;align-items:flex-start;gap:15px;padding:15px 18px;cursor:pointer;user-select:none;border-bottom:1px solid #f1f5f9;transition:background .12s}
+  .ntsc-fr-opt:last-child{border-bottom:0}
+  .ntsc-fr-opt:hover{background:#f8fbff}
+  .ntsc-fr-opt input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+  .ntsc-fr-switch{flex:0 0 auto;width:50px;height:29px;margin-top:1px;border-radius:999px;background:#cbd5e1;position:relative;transition:background .18s}
+  .ntsc-fr-switch::after{content:"";position:absolute;top:3px;left:3px;width:23px;height:23px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(15,23,42,.28);transition:transform .18s}
+  .ntsc-fr-opt input:checked + .ntsc-fr-switch{background:#007fbe}
+  .ntsc-fr-opt input:checked + .ntsc-fr-switch::after{transform:translateX(21px)}
+  .ntsc-fr-opt input:focus-visible + .ntsc-fr-switch{box-shadow:0 0 0 3px rgba(0,127,190,.35)}
+  .ntsc-fr-txt b{display:block;font-size:14.5px;font-weight:600;color:#0f172a}
+  .ntsc-fr-reload{font-style:normal;font-size:9.5px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:#b45309;background:#fef3c7;border-radius:5px;padding:2px 5px;margin-left:6px;vertical-align:2px}
+  .ntsc-fr-txt span{display:block;color:#64748b;font-size:12.5px;margin-top:3px}
+  .ntsc-fr-opt.ntsc-fr-sub{padding-left:34px;background:#fcfdff}
+  .ntsc-fr-opt.ntsc-fr-dim{opacity:.45}
+  .ntsc-fr-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;padding:16px 18px}
+  .ntsc-fr-stats div{background:#f8fbff;border:1px solid #e6eef7;border-radius:11px;padding:12px 14px;text-align:center}
+  .ntsc-fr-stats span{display:block;font-size:24px;font-weight:700;color:#007fbe}
+  .ntsc-fr-stats b{display:block;margin-top:3px;font-size:11.5px;font-weight:500;color:#64748b}
+  .ntsc-fr-actions{display:flex;flex-wrap:wrap;gap:10px;padding:16px 18px}
+  .ntsc-fr-btn{border:1px solid #cbd5e1;background:#fff;border-radius:9px;padding:9px 15px;font-size:13px;font-weight:600;color:#0f172a;cursor:pointer}
+  .ntsc-fr-btn:hover{background:#eff6ff;border-color:#bfdbfe}
+  .ntsc-fr-btn.ntsc-fr-danger{color:#b91c1c;border-color:#fecaca}
+  .ntsc-fr-btn.ntsc-fr-danger:hover{background:#fef2f2;border-color:#fca5a5}
+  .ntsc-fr-phrase{display:flex;align-items:center;gap:10px;padding:15px 18px;flex-wrap:wrap}
+  .ntsc-fr-phrase input{flex:1 1 170px;min-width:120px;padding:9px 12px;border:1px solid #cbd5e1;border-radius:9px;background:#f8fafc;color:#0f172a;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}
+  .ntsc-fr-phrase input:focus{outline:none;border-color:#007fbe;background:#fff;box-shadow:0 0 0 3px rgba(0,127,190,.14)}
+  .ntsc-fr-how{margin:0;padding:14px 18px 16px 36px;color:#334155;font-size:13px}
+  .ntsc-fr-how li{margin:5px 0}
+  .ntsc-fr-how code,.ntsc-fr-phrase code{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:5px;padding:1px 6px;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#0b4f7a}
+  .ntsc-fr-empty-search{padding:22px 18px;color:#94a3b8;font-size:13px;text-align:center;display:none}
+  @media (max-width:620px){
+    .ntsc-fr-top{flex-wrap:wrap}
+    .ntsc-fr-search{order:3;max-width:none;width:100%;margin-left:0}
+    .ntsc-fr-opt{padding:14px}
+    .ntsc-fr-opt.ntsc-fr-sub{padding-left:28px}
+    .ntsc-fr-scroll{padding:14px 12px 32px}
+  }
+    `;
 
   let badgeEl = null;
   let panelEl = null;
@@ -1354,72 +1848,11 @@
     badgeEl = document.createElement('div');
     badgeEl.className = 'ntsc-fr-badge';
     badgeEl.innerHTML = '<span class="ntsc-fr-dot"></span><span class="ntsc-fr-text">NTSC Tools</span>';
-    badgeEl.title = 'NTSC Tools — result unlock + pop-up blocker. Click to configure.';
-    badgeEl.addEventListener('click', togglePanel);
+    badgeEl.title = 'NTSC Tools — result unlock + pop-up blocker\nClick to open settings  ·  Alt+N  ·  or type s.ntsc';
+    badgeEl.addEventListener('click', toggleSettings);
     document.body.appendChild(badgeEl);
     badgeEl.style.display = cfg.showBadge ? '' : 'none';
     updateBadge();
-  }
-
-  function togglePanel() {
-    if (panelEl) { removePanel(); return; }
-
-    panelEl = document.createElement('div');
-    panelEl.className = 'ntsc-fr-panel';
-    panelEl.innerHTML = `
-      <h4>NTSC Tools <small>result + pop-up</small></h4>
-      <div class="ntsc-fr-sep">Exam hall</div>
-      <label class="ntsc-fr-row"><input type="checkbox" data-k="autoUnlock" ${cfg.autoUnlock ? 'checked' : ''}>
-        <div><b>Auto-unlock result flags</b><span>Flips isPublish / isResultAutoPublish in the GetTests response so the button is active like a normal test.</span></div></label>
-      <label class="ntsc-fr-row"><input type="checkbox" data-k="forceClick" ${cfg.forceClick ? 'checked' : ''}>
-        <div><b>Force-click locked buttons</b><span>Any Result button still disabled gets unlocked and routed through the site's own result flow.</span></div></label>
-      <label class="ntsc-fr-row"><input type="checkbox" data-k="forceLeaderboard" ${cfg.forceLeaderboard ? 'checked' : ''}>
-        <div><b>Force leaderboard</b><span>Adds the Leader Board tab to results that hide it (skipped automatically for tests that have none).</span></div></label>
-      <div class="ntsc-fr-sep">Home page pop-up</div>
-      <label class="ntsc-fr-row"><input type="checkbox" data-k="hidePopup" ${cfg.hidePopup ? 'checked' : ''}>
-        <div><b>Block the home pop-up</b><span>Master switch. Kills the full-screen "Special Announcement" every time the site loads.</span></div></label>
-      <label class="ntsc-fr-row ntsc-fr-sub"><input type="checkbox" data-k="popupBlockApi" ${cfg.popupBlockApi ? 'checked' : ''}>
-        <div><b>A · Remove it from the banner API</b><span>Drops the HomePagePopupBanner from GetWebBanners, so the overlay is never even built.</span></div></label>
-      <label class="ntsc-fr-row ntsc-fr-sub"><input type="checkbox" data-k="popupSeenFlag" ${cfg.popupSeenFlag ? 'checked' : ''}>
-        <div><b>B · Pretend it was already seen</b><span>Makes sessionStorage answer "true" for every hasSeenPopup_* key.</span></div></label>
-      <label class="ntsc-fr-row ntsc-fr-sub"><input type="checkbox" data-k="popupKillDom" ${cfg.popupKillDom ? 'checked' : ''}>
-        <div><b>C · Hide anything that still renders</b><span>CSS + sweep on .home-popup-overlay. Last line of defence.</span></div></label>
-      <div class="ntsc-fr-sep">General</div>
-      <label class="ntsc-fr-row"><input type="checkbox" data-k="showBadge" ${cfg.showBadge ? 'checked' : ''}>
-        <div><b>Show this badge</b><span>Hide it if you want a clean exam hall.</span></div></label>
-      <label class="ntsc-fr-row"><input type="checkbox" data-k="debug" ${cfg.debug ? 'checked' : ''}>
-        <div><b>Debug logs</b><span>Print what the script does to the browser console.</span></div></label>
-      <div class="ntsc-fr-foot"><span>v1.3 · <span id="ntsc-fr-count">${forcedCount}</span> unlocked · <span id="ntsc-fr-pcount">${popupTotal()}</span> pop-ups blocked</span><button type="button" id="ntsc-fr-rescan">Re-scan now</button></div>
-    `;
-    document.body.appendChild(panelEl);
-    panelPopupCount = panelEl.querySelector('#ntsc-fr-pcount');
-
-    panelEl.querySelectorAll('input[data-k]').forEach((inp) => {
-      inp.addEventListener('change', () => {
-        const k = inp.getAttribute('data-k');
-        cfg[k] = inp.checked;
-        saveCfg();
-        if (k === 'showBadge' && badgeEl) badgeEl.style.display = cfg.showBadge ? '' : 'none';
-        updateBadge();
-
-        if (POPUP_KEYS.has(k)) {
-          applyPopupSettings();
-          toast(cfg.hidePopup ? 'Pop-up blocker: ON' : 'Pop-up blocker: OFF');
-        } else if (k === 'autoUnlock' || k === 'forceClick' || k === 'forceLeaderboard') {
-          toast('Saved — reload the page for network-level changes');
-        }
-      });
-    });
-
-    panelEl.querySelector('#ntsc-fr-rescan').addEventListener('click', () => {
-      scan();
-      toast('Re-scanned the page');
-    });
-  }
-
-  function removePanel() {
-    if (panelEl && panelEl.parentNode) panelEl.parentNode.removeChild(panelEl);
-    panelEl = null;
   }
 
   function toast(msg) {
@@ -1501,6 +1934,7 @@
     buildBadge();
     scan();
     startObservers();
+    installSettingsTriggers();
     log('booted · pop-ups blocked:', popupTotal());
   }
 
@@ -1527,6 +1961,7 @@
     GM_registerMenuCommand('Toggle debug logs', () => {
       cfg.debug = !cfg.debug; saveCfg(); toast('Debug: ' + (cfg.debug ? 'ON' : 'OFF'));
     });
+    GM_registerMenuCommand('Open settings', () => { openSettings(); });
     GM_registerMenuCommand('Re-scan now', () => { scan(); toast('Re-scanned'); });
   }
 
