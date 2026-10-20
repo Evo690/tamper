@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NTSC Exam Hall — Force Result Unlock
 // @namespace    https://ntsc.narayanatalent.com/
-// @version      1.2.0
-// @description  Unlocks the Exam Hall "Result" button when NTSC leaves it disabled (result published but flag not updated / exam-hall glitch) and forces the Leader Board tab on results that hide it. Uses the site's own code path and APIs.
+// @version      1.3.0
+// @description  Unlocks the Exam Hall "Result" button when NTSC leaves it disabled (result published but flag not updated / exam-hall glitch), forces the Leader Board tab on results that hide it, and kills the full-screen "Special Announcement" home page pop-up. Uses the site's own code path and APIs.
 // @author       arena
 // @license      MIT
 // @icon         https://ntsc.narayanatalent.com/favicon.ico
@@ -69,6 +69,56 @@
 
  Nothing is written to the server. No exam data is modified - it only changes
  what the page thinks about the publish flags.
+
+ ---------------------------------------------------------------------------
+ HOME PAGE POP-UP BLOCKER  (added in 1.3.0)
+ ---------------------------------------------------------------------------
+ The full-screen "Special Announcement" overlay is a shared component.
+ Decoded from chunk 5799.*.chunk.js of the live bundle (module 2379):
+
+     const key = `hasSeenPopup_${props.storageKey || window.location.pathname}`;
+     //                                  -> "hasSeenPopup_homePagePopup"
+     useEffect(() => {
+       if (!sessionStorage.getItem(key) && props.imageData) setShow(true);
+       else setShow(false);
+     }, [props.imageData, key]);
+     ...
+     return show && (
+       <div className={"home-popup-overlay " + (canClose ? "can-close" : "")}>
+         <div className="home-popup-content">
+           {canClose ? <button className="close-btn">x</button>
+                     : <div className="popup-countdown">{count}</div>}
+           <img className="popup-image" src={...} onClick={open} />
+           <button className="navigate-btn">Click Here</button>
+         </div>
+       </div>);
+
+ The home page feeds it with:
+
+     <Popup storageKey="homePagePopup"
+            imageData={bannerList.find(b => b.bannerType === 6)} />
+
+ where bannerList comes from
+     GET /general-service/api/Banner/GetWebBanners   ->  { data: [...] }
+
+ Two reasons it comes back on *every* visit:
+   * the "seen" flag lives in **sessionStorage**, so a new tab = new session;
+   * the banner is re-fetched from the API on every load.
+
+ Three independent defences, all toggleable in the badge panel:
+
+   A. API STRIP      - drop the bannerType 6 entry from the GetWebBanners
+                       response, so `imageData` is undefined and React never
+                       mounts the overlay at all. No flash, the 500x500
+                       CloudFront image is never even requested.
+   B. SEEN FLAG      - make sessionStorage.getItem("hasSeenPopup_*") answer
+                       "true", so every other instance of the component
+                       (any route / any future storageKey) stays shut too.
+   C. DOM KILL       - a stylesheet + a sweep that hides
+                       `.home-popup-overlay` if it somehow still renders
+                       (cached Redux state, site refactor, ...).
+
+ Nothing is written to the server, nothing is blocked for other banners.
  ---------------------------------------------------------------------------
 */
 
@@ -84,10 +134,24 @@
     forceClick: true,        // force layer: unlock+route still-disabled buttons
     forceLeaderboard: true,  // add the Leader Board tab to results that hide it
     showBadge: true,         // floating badge
-    debug: false
+    debug: false,
+
+    // ---- home page pop-up blocker (1.3.0) ----
+    hidePopup: true,         // MASTER switch for the pop-up blocker
+    popupBlockApi: true,     // A: strip bannerType 6 from GetWebBanners
+    popupSeenFlag: true,     // B: pretend sessionStorage says "already seen"
+    popupKillDom: true       // C: hide any overlay that still renders
   };
 
   const cfg = Object.assign({}, DEFAULTS, loadCfg());
+
+  // how many pop-ups each defence layer has stopped in this page load
+  const POPUP_STATS = { api: 0, seen: 0, dom: 0 };
+  // A and B both describe the same "never rendered" event, so they count once;
+  // C counts every overlay it actually had to hide.
+  const popupTotal = () =>
+    ((POPUP_STATS.api > 0 || POPUP_STATS.seen > 0) ? 1 : 0) + POPUP_STATS.dom;
+  const POPUP_KEYS = new Set(['hidePopup', 'popupBlockApi', 'popupSeenFlag', 'popupKillDom']);
 
   function loadCfg() {
     try {
@@ -144,6 +208,9 @@
     ],
     leaderboard: [
       /\/exam-service\/api\/ExaminationHall\/GetLeaderboardScore(\?|$)/i
+    ],
+    banners: [
+      /\/general-service\/api\/Banner\/GetWebBanners(\?|$)/i
     ]
   };
 
@@ -311,7 +378,39 @@
     if (kind === 'tests') return patchTestPayload(json);
     if (kind === 'analysis') return patchAnalysisPayload(json);
     if (kind === 'leaderboard') return noteLeaderboardResult(json, requestBody);
+    if (kind === 'banners') return patchBannerPayload(json);
     return false;
+  }
+
+  /* ---- home pop-up: remove the HomePagePopupBanner from the banner list ---
+     The home page does:
+         imageData = bannerList.find(b => b.bannerType === 6)
+     and only renders the overlay when that object exists. No object, no pop-up
+     - and the banner image is never requested either.
+  ---------------------------------------------------------------------- */
+  const POPUP_BANNER_TYPE = 6; // BannerType.HomePagePopupBanner (main.js)
+
+  function isPopupBanner(b) {
+    if (!b || typeof b !== 'object') return false;
+    // bannerType is always present - trust it when it is
+    if (b.bannerType != null) return Number(b.bannerType) === POPUP_BANNER_TYPE;
+    // otherwise fall back to the CMS title ("NTSC Home Pop-Up")
+    return /pop\s*-?\s*up/i.test(String(b.title || ''));
+  }
+
+  function patchBannerPayload(json) {
+    if (!cfg.hidePopup || !cfg.popupBlockApi) return false;
+    if (!json || !Array.isArray(json.data)) return false;
+
+    const before = json.data.length;
+    const kept = json.data.filter((b) => !isPopupBanner(b));
+    if (kept.length === before) return false;
+
+    json.data = kept;
+    POPUP_STATS.api += before - kept.length;
+    log('popup: dropped', before - kept.length, 'home pop-up banner(s) from GetWebBanners');
+    bumpPopupCounter();
+    return true;
   }
 
   function installLazyResponsePatch(xhr, XHR, kind) {
@@ -1031,6 +1130,143 @@
   }
 
   /* ======================================================================
+   * 6b. HOME POP-UP BLOCKER
+   * ==================================================================== */
+
+  /* ---- B. SEEN FLAG ----------------------------------------------------
+     sessionStorage.getItem('hasSeenPopup_homePagePopup') gates the overlay.
+     We lie and say "already seen" for ANY key with that prefix, so every
+     instance of the component stays shut - no matter the route or storageKey.
+  ---------------------------------------------------------------------- */
+  const POPUP_SEEN_PREFIX = 'hasSeenPopup_';
+
+  function installSeenFlagPatch() {
+    try {
+      const proto = PAGE.Storage && PAGE.Storage.prototype;
+      const ss = PAGE.sessionStorage;
+      if (!proto || !ss || proto.__ntscSeenHooked) return false;
+      proto.__ntscSeenHooked = true;
+
+      const origGet = proto.getItem;
+      proto.getItem = function (key) {
+        try {
+          if (this === ss && cfg.hidePopup && cfg.popupSeenFlag &&
+              typeof key === 'string' && key.indexOf(POPUP_SEEN_PREFIX) === 0) {
+            const real = origGet.call(this, key);
+            if (!real) {
+              POPUP_STATS.seen++;
+              log('popup: faking seen flag for', key);
+              return 'true';
+            }
+            return real;
+          }
+        } catch (e) { /* ignore */ }
+        return origGet.apply(this, arguments);
+      };
+      log('popup: sessionStorage hook installed');
+      return true;
+    } catch (e) {
+      log('popup: sessionStorage hook failed', e);
+      return false;
+    }
+  }
+
+  /* ---- C. DOM KILL -----------------------------------------------------
+     Last line of defence. A stylesheet switch (applies from the very first
+     paint, zero flash) plus a sweep that hides anything already in the DOM.
+  ---------------------------------------------------------------------- */
+  const POPUP_SEL = '.home-popup-overlay';
+  const POPUP_CSS = `
+  .home-popup-overlay{display:none!important;visibility:hidden!important;pointer-events:none!important}
+  .home-popup-overlay .popup-image{content-visibility:hidden}
+  `;
+  const POPUP_HIDDEN = ['display', 'visibility', 'pointer-events'];
+
+  let popupStyleEl = null;
+  let panelPopupCount = null;
+  const popupKilled = new Set();
+
+  /** Keep the panel's "pop-ups blocked" counter in sync. */
+  function bumpPopupCounter() {
+    if (panelPopupCount) panelPopupCount.textContent = String(popupTotal());
+  }
+
+  function injectPopupStyle() {
+    if (popupStyleEl && popupStyleEl.isConnected) return popupStyleEl;
+    try {
+      const el = document.createElement('style');
+      el.id = 'ntsc-fr-nopopup';
+      el.textContent = POPUP_CSS;
+      const host = document.head || document.documentElement || document.body;
+      if (!host) return null;               // ran too early - caller retries
+      host.appendChild(el);
+      popupStyleEl = el;
+      return el;
+    } catch (e) {
+      log('popup: style inject failed', e);
+      return null;
+    }
+  }
+
+  function syncPopupStyle() {
+    try {
+      const el = injectPopupStyle();
+      if (el) el.disabled = !(cfg.hidePopup && cfg.popupKillDom);
+    } catch (e) { log('popup: style sync failed', e); }
+  }
+
+  function restorePopups() {
+    popupKilled.forEach((el) => {
+      POPUP_HIDDEN.forEach((p) => el.style.removeProperty(p));
+      el.removeAttribute('data-ntsc-fr-hidden');
+    });
+    popupKilled.clear();
+    syncPopupStyle();
+  }
+
+  /** Hide any overlay that is already in the DOM. Returns how many it hid. */
+  function sweepPopups() {
+    if (!cfg.hidePopup || !cfg.popupKillDom) { if (popupKilled.size) restorePopups(); return 0; }
+    if (!document.body) return 0;
+
+    let n = 0;
+    document.querySelectorAll(POPUP_SEL).forEach((el) => {
+      if (popupKilled.has(el)) return;
+      // Hide inline (React never re-renders this element's style, so it sticks)
+      // rather than removing it - removing a React-owned node can throw.
+      el.style.setProperty('display', 'none', 'important');
+      el.style.setProperty('visibility', 'hidden', 'important');
+      el.style.setProperty('pointer-events', 'none', 'important');
+      el.setAttribute('data-ntsc-fr-hidden', '1');
+      popupKilled.add(el);
+      n++;
+      POPUP_STATS.dom++;
+      log('popup: hid a rendered overlay');
+    });
+
+    if (n) bumpPopupCounter();
+    return n;
+  }
+
+  let popupSweepQueued = false;
+
+  function queuePopupSweep() {
+    if (popupSweepQueued) return;
+    popupSweepQueued = true;
+    requestAnimationFrame(() => {
+      popupSweepQueued = false;
+      try { sweepPopups(); } catch (e) { log('popup sweep error', e); }
+    });
+  }
+
+  /** Called whenever the pop-up settings change. */
+  function applyPopupSettings() {
+    syncPopupStyle();
+    sweepPopups();
+    if (panelPopupCount) panelPopupCount.textContent = String(popupTotal());
+  }
+
+  /* ======================================================================
    * 6. UI — badge, settings panel, toast
    * ==================================================================== */
   const CSS = `
@@ -1045,6 +1281,9 @@
   .ntsc-fr-panel .ntsc-fr-row{display:flex;align-items:flex-start;gap:10px;padding:11px 15px;border-bottom:1px solid #f1f5f9;cursor:pointer}
   .ntsc-fr-panel .ntsc-fr-row:hover{background:#f8fbff}
   .ntsc-fr-panel .ntsc-fr-row input{margin-top:2px;accent-color:#007fbe}
+  .ntsc-fr-panel .ntsc-fr-row.ntsc-fr-sub{padding-left:30px;background:#fcfdff}
+  .ntsc-fr-panel .ntsc-fr-row.ntsc-fr-sub b{font-weight:500;color:#334155}
+  .ntsc-fr-panel .ntsc-fr-sep{padding:8px 15px;background:#f1f5f9;color:#64748b;font-size:10.5px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;border-bottom:1px solid #e2e8f0}
   .ntsc-fr-panel .ntsc-fr-row b{display:block;font-size:12.5px;font-weight:600}
   .ntsc-fr-panel .ntsc-fr-row span{color:#64748b;font-size:11.5px}
   .ntsc-fr-foot{padding:10px 15px;display:flex;justify-content:space-between;align-items:center;color:#64748b;font-size:11.5px;background:#f8fbff}
@@ -1095,25 +1334,27 @@
 
   function injectStyle() {
     if (document.getElementById('ntsc-fr-style')) return;
+    const host = document.head || document.documentElement || document.body;
+    if (!host) return;
     const st = document.createElement('style');
     st.id = 'ntsc-fr-style';
     st.textContent = CSS;
-    (document.head || document.documentElement).appendChild(st);
+    host.appendChild(st);
   }
 
   function updateBadge() {
     if (!badgeEl) return;
-    const on = cfg.autoUnlock || cfg.forceClick;
+    const on = cfg.autoUnlock || cfg.forceClick || cfg.hidePopup;
     badgeEl.classList.toggle('ntsc-fr-off', !on);
-    badgeEl.querySelector('.ntsc-fr-text').textContent = on ? 'Result Unlock' : 'Result Unlock · off';
+    badgeEl.querySelector('.ntsc-fr-text').textContent = on ? 'NTSC Tools' : 'NTSC Tools · off';
   }
 
   function buildBadge() {
     if (badgeEl) return;
     badgeEl = document.createElement('div');
     badgeEl.className = 'ntsc-fr-badge';
-    badgeEl.innerHTML = '<span class="ntsc-fr-dot"></span><span class="ntsc-fr-text">Result Unlock</span>';
-    badgeEl.title = 'NTSC Exam Hall Result Unlock — click to configure';
+    badgeEl.innerHTML = '<span class="ntsc-fr-dot"></span><span class="ntsc-fr-text">NTSC Tools</span>';
+    badgeEl.title = 'NTSC Tools — result unlock + pop-up blocker. Click to configure.';
     badgeEl.addEventListener('click', togglePanel);
     document.body.appendChild(badgeEl);
     badgeEl.style.display = cfg.showBadge ? '' : 'none';
@@ -1126,20 +1367,32 @@
     panelEl = document.createElement('div');
     panelEl.className = 'ntsc-fr-panel';
     panelEl.innerHTML = `
-      <h4>Result Unlock <small>exam hall fix</small></h4>
+      <h4>NTSC Tools <small>result + pop-up</small></h4>
+      <div class="ntsc-fr-sep">Exam hall</div>
       <label class="ntsc-fr-row"><input type="checkbox" data-k="autoUnlock" ${cfg.autoUnlock ? 'checked' : ''}>
         <div><b>Auto-unlock result flags</b><span>Flips isPublish / isResultAutoPublish in the GetTests response so the button is active like a normal test.</span></div></label>
       <label class="ntsc-fr-row"><input type="checkbox" data-k="forceClick" ${cfg.forceClick ? 'checked' : ''}>
         <div><b>Force-click locked buttons</b><span>Any Result button still disabled gets unlocked and routed through the site's own result flow.</span></div></label>
       <label class="ntsc-fr-row"><input type="checkbox" data-k="forceLeaderboard" ${cfg.forceLeaderboard ? 'checked' : ''}>
         <div><b>Force leaderboard</b><span>Adds the Leader Board tab to results that hide it (skipped automatically for tests that have none).</span></div></label>
+      <div class="ntsc-fr-sep">Home page pop-up</div>
+      <label class="ntsc-fr-row"><input type="checkbox" data-k="hidePopup" ${cfg.hidePopup ? 'checked' : ''}>
+        <div><b>Block the home pop-up</b><span>Master switch. Kills the full-screen "Special Announcement" every time the site loads.</span></div></label>
+      <label class="ntsc-fr-row ntsc-fr-sub"><input type="checkbox" data-k="popupBlockApi" ${cfg.popupBlockApi ? 'checked' : ''}>
+        <div><b>A · Remove it from the banner API</b><span>Drops the HomePagePopupBanner from GetWebBanners, so the overlay is never even built.</span></div></label>
+      <label class="ntsc-fr-row ntsc-fr-sub"><input type="checkbox" data-k="popupSeenFlag" ${cfg.popupSeenFlag ? 'checked' : ''}>
+        <div><b>B · Pretend it was already seen</b><span>Makes sessionStorage answer "true" for every hasSeenPopup_* key.</span></div></label>
+      <label class="ntsc-fr-row ntsc-fr-sub"><input type="checkbox" data-k="popupKillDom" ${cfg.popupKillDom ? 'checked' : ''}>
+        <div><b>C · Hide anything that still renders</b><span>CSS + sweep on .home-popup-overlay. Last line of defence.</span></div></label>
+      <div class="ntsc-fr-sep">General</div>
       <label class="ntsc-fr-row"><input type="checkbox" data-k="showBadge" ${cfg.showBadge ? 'checked' : ''}>
         <div><b>Show this badge</b><span>Hide it if you want a clean exam hall.</span></div></label>
       <label class="ntsc-fr-row"><input type="checkbox" data-k="debug" ${cfg.debug ? 'checked' : ''}>
         <div><b>Debug logs</b><span>Print what the script does to the browser console.</span></div></label>
-      <div class="ntsc-fr-foot"><span>v1.0 · <span id="ntsc-fr-count">${forcedCount}</span> unlocked</span><button type="button" id="ntsc-fr-rescan">Re-scan now</button></div>
+      <div class="ntsc-fr-foot"><span>v1.3 · <span id="ntsc-fr-count">${forcedCount}</span> unlocked · <span id="ntsc-fr-pcount">${popupTotal()}</span> pop-ups blocked</span><button type="button" id="ntsc-fr-rescan">Re-scan now</button></div>
     `;
     document.body.appendChild(panelEl);
+    panelPopupCount = panelEl.querySelector('#ntsc-fr-pcount');
 
     panelEl.querySelectorAll('input[data-k]').forEach((inp) => {
       inp.addEventListener('change', () => {
@@ -1148,7 +1401,11 @@
         saveCfg();
         if (k === 'showBadge' && badgeEl) badgeEl.style.display = cfg.showBadge ? '' : 'none';
         updateBadge();
-        if (k === 'autoUnlock' || k === 'forceClick') {
+
+        if (POPUP_KEYS.has(k)) {
+          applyPopupSettings();
+          toast(cfg.hidePopup ? 'Pop-up blocker: ON' : 'Pop-up blocker: OFF');
+        } else if (k === 'autoUnlock' || k === 'forceClick' || k === 'forceLeaderboard') {
           toast('Saved — reload the page for network-level changes');
         }
       });
@@ -1190,6 +1447,7 @@
       resultButtons().forEach(processButton);
     } catch (e) { log('scan error', e); }
     try { syncLeaderboardPill(); } catch (e) { log('pill error', e); }
+    try { sweepPopups(); } catch (e) { log('popup sweep error', e); }
     const counter = document.getElementById('ntsc-fr-count');
     if (counter) counter.textContent = String(forcedCount);
   }
@@ -1227,16 +1485,23 @@
       attributeFilter: ['disabled', 'class', 'aria-disabled']
     });
 
+    // dedicated observer for the pop-up overlay (rAF-debounced, it is cheap)
+    if (cfg.hidePopup && cfg.popupKillDom) {
+      const po = new MutationObserver(queuePopupSweep);
+      po.observe(document.documentElement, { childList: true, subtree: true });
+    }
+
     // safety net (countdown timers re-render rows every second)
     setInterval(scan, 1500);
   }
 
   function boot() {
     injectStyle();
+    syncPopupStyle();
     buildBadge();
     scan();
     startObservers();
-    log('booted');
+    log('booted · pop-ups blocked:', popupTotal());
   }
 
   /* ---- menu commands -------------------------------------------------- */
@@ -1253,6 +1518,12 @@
       syncLeaderboardPill();
       toast('Force leaderboard: ' + (cfg.forceLeaderboard ? 'ON' : 'OFF') + ' (reload to apply)');
     });
+    GM_registerMenuCommand('Toggle home pop-up blocker', () => {
+      cfg.hidePopup = !cfg.hidePopup; saveCfg(); updateBadge();
+      applyPopupSettings();
+      toast('Home pop-up blocker: ' + (cfg.hidePopup ? 'ON' : 'OFF') +
+            (cfg.hidePopup ? '' : ' (reload to let it through again)'));
+    });
     GM_registerMenuCommand('Toggle debug logs', () => {
       cfg.debug = !cfg.debug; saveCfg(); toast('Debug: ' + (cfg.debug ? 'ON' : 'OFF'));
     });
@@ -1263,9 +1534,18 @@
   // Network hooks must be installed before the app bundle runs.
   try { installXhrHook(); } catch (e) { console.warn('[NTSC·ResultUnlock] xhr hook failed', e); }
   try { installFetchHook(); } catch (e) { console.warn('[NTSC·ResultUnlock] fetch hook failed', e); }
+  try { installSeenFlagPatch(); } catch (e) { console.warn('[NTSC·ResultUnlock] popup hook failed', e); }
+
+  // CSS kill switch: get it in before the first paint if we possibly can.
+  try { syncPopupStyle(); } catch (e) { /* retried in boot() */ }
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot, { once: true });
+    // some managers fire us before <head> exists - keep trying until it does
+    const earlyTry = setInterval(() => {
+      if (popupStyleEl || document.readyState !== 'loading') { clearInterval(earlyTry); return; }
+      try { syncPopupStyle(); } catch (e) { /* ignore */ }
+    }, 10);
   } else {
     boot();
   }
